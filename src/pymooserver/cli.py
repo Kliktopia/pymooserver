@@ -39,6 +39,7 @@ from .moo12 import (
 )
 from mooapi import MooServer, ServerConfig
 from mooapi.app import MooApplication
+from mooapi.moodplay import MooDPlayApplication
 
 DEFAULT_MOO12_PORTS = (1200,)
 DEFAULT_MOOAPI_PORTS = (1203, 3205)
@@ -232,6 +233,38 @@ class _StatusApplication(MooApplication):
         self._changed()
 
     def on_disconnect(self, client):
+        self._changed()
+
+
+class _MooDPlayStatusApplication(MooDPlayApplication):
+    """mooDPlay policy layered onto a normal MooAPI realm plus status reporting."""
+
+    def __init__(self, reporter):
+        super().__init__()
+        self.reporter = reporter
+
+    def _changed(self):
+        self.reporter.changed()
+
+    def on_connect(self, client):
+        self._changed()
+
+    def on_hello(self, client):
+        self._changed()
+
+    async def on_join(self, client, session):
+        await super().on_join(client, session)
+        self._changed()
+
+    async def on_leave(self, client, session):
+        await super().on_leave(client, session)
+        self._changed()
+
+    def on_rename(self, client):
+        self._changed()
+
+    def on_disconnect(self, client):
+        super().on_disconnect(client)
         self._changed()
 
 
@@ -489,12 +522,12 @@ async def run_unified(args: argparse.Namespace) -> None:
     mooapi_ports = _unique_ports(args.mooapi_ports, DEFAULT_MOOAPI_PORTS)
 
     LOG.info(
-        'server configuration host=%s legacy_tcp=%s mooapi_tcp=%s mooapi_udp=%s mooapi_dialect=%s '
+        'server configuration host=%s legacy_tcp=%s mooapi_tcp=%s mooapi_udp=%s mooapi_dialect=%s moodplay=%s '
         'ini_root=%s shared_ini=%s status=%s backups=%s legacy_limits=%s/%s '
         'legacy_timeouts=unsigned:%ss write:%ss legacy_ini_limits=files:%s keys:%s bytes:%s watchdog=%ss/%ss',
         args.host, moo12_ports, mooapi_ports,
         'disabled' if args.no_mooapi_udp else [p + 1 for p in mooapi_ports],
-        args.mooapi_dialect, args.ini_root, args.shared_ini, not args.no_status, not args.no_backups,
+        args.mooapi_dialect, 'disabled' if args.no_moodplay else 'enabled', args.ini_root, args.shared_ini, not args.no_status, not args.no_backups,
         args.legacy_max_connections or 'off', args.legacy_max_connections_per_ip or 'off',
         args.legacy_unsigned_timeout, args.legacy_write_timeout,
         args.legacy_ini_max_files or 'off', args.legacy_ini_max_keys_per_file or 'off',
@@ -564,14 +597,21 @@ async def run_unified(args: argparse.Namespace) -> None:
                 ini_shared=args.shared_ini,
                 dialect=args.mooapi_dialect,
             )
+            app = (
+                _StatusApplication(status_reporter)
+                if args.no_moodplay
+                else _MooDPlayStatusApplication(status_reporter)
+            )
             runtime = MooServer(
-                app=_StatusApplication(status_reporter),
+                app=app,
                 config=config,
                 host=args.host,
                 port=port,
                 udp_port=(port + 1) if not args.no_mooapi_udp else None,
                 enable_udp=not args.no_mooapi_udp,
             )
+            if isinstance(app, MooDPlayApplication):
+                app.bind(runtime)
             await runtime.start()
             mooapi_servers.append(runtime)
             mooapi_realms.append((port, runtime))
@@ -579,10 +619,11 @@ async def run_unified(args: argparse.Namespace) -> None:
             backup_realms.append((port, ini_dir))
             udp_text = 'disabled' if args.no_mooapi_udp else str(runtime.udp.port if runtime.udp else port + 1)
             LOG.info(
-                'MooAPI realm TCP %d / UDP %s listening on %s; INI/IMI=%s',
+                'MooAPI realm TCP %d / UDP %s listening on %s; mooDPlay=%s; INI/IMI=%s',
                 port,
                 udp_text,
                 args.host,
+                'disabled' if args.no_moodplay else 'enabled',
                 ini_dir,
             )
 
@@ -671,6 +712,11 @@ def build_unified_parser() -> argparse.ArgumentParser:
         action='append',
         type=int,
         help='MooAPI TCP port; repeat for multiple realms (defaults: 1203 and 3205, UDP is TCP+1)',
+    )
+    parser.add_argument(
+        '--no-moodplay',
+        action='store_true',
+        help='disable mooDPlay enhancement on normal MooAPI listeners',
     )
     parser.add_argument(
         '--no-mooapi-udp',

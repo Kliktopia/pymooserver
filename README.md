@@ -146,3 +146,14 @@ firewall.
 ## License
 
 PyMooServer is licensed under the Apache License 2.0. See [`LICENSE`](LICENSE).
+
+
+## mooDPlay compatibility
+
+Normal MooAPI listeners are mooDPlay-capable by default. A mooDPlay client first
+completes the normal MooAPI handshake, then explicitly identifies itself using the
+reserved reliable DPSC control channel. Native MooAPI clients remain in the normal
+realm; identified mooDPlay clients use a separate application-GUID-scoped logical
+session namespace with authoritative host, kick, password, max-player and migration
+handling. mooDPlay controls are TCP-only; native UDP/Blast behavior remains available
+to ordinary MooAPI clients. Use `--no-moodplay` to disable the enhancement.
