@@ -214,7 +214,12 @@ class TcpPeer:
         connection = self.adapter.runtime.hub.connections.get(self.connection_id)
         if not self.identified and cfg.identification_timeout:
             deadlines.append(self.started + cfg.identification_timeout)
-        if connection is not None and not connection.hello_complete and cfg.hello_timeout:
+        if (
+            cfg.require_hello
+            and connection is not None
+            and not connection.hello_complete
+            and cfg.hello_timeout
+        ):
             deadlines.append(self.started + cfg.hello_timeout)
         if self.partial_since is not None and cfg.partial_packet_timeout:
             deadlines.append(self.partial_since + cfg.partial_packet_timeout)
@@ -270,18 +275,18 @@ class TcpPeer:
 
                 if not self.identified:
                     self.identification_buffer.extend(chunk)
-                    if len(self.identification_buffer) > self.adapter.config.preidentify_buffer:
-                        self.close_reason = "pre-identification buffer exceeded"
-                        self.adapter._log.debug(
-                            "TCP %d id=%d closing reason=%s bytes=%d",
-                            self.adapter.port, self.connection_id, self.close_reason,
-                            len(self.identification_buffer),
-                        )
-                        effects = self.adapter.runtime.hub.disconnect(self.connection_id)
-                        await self.adapter.runtime._handle_effects(effects)
-                        return
                     classification = _classify_initial_bytes(bytes(self.identification_buffer))
                     if classification is None:
+                        if len(self.identification_buffer) > self.adapter.config.preidentify_buffer:
+                            self.close_reason = "pre-identification buffer exceeded"
+                            self.adapter._log.debug(
+                                "TCP %d id=%d closing reason=%s bytes=%d",
+                                self.adapter.port, self.connection_id, self.close_reason,
+                                len(self.identification_buffer),
+                            )
+                            effects = self.adapter.runtime.hub.disconnect(self.connection_id)
+                            await self.adapter.runtime._handle_effects(effects)
+                            return
                         continue
                     if classification != "moo":
                         self.close_reason = "non-Moo preface: %s" % classification
@@ -383,7 +388,8 @@ class TcpPeer:
         ):
             return "identification timeout"
         if (
-            connection is not None
+            cfg.require_hello
+            and connection is not None
             and not connection.hello_complete
             and cfg.hello_timeout
             and now >= self.started + cfg.hello_timeout

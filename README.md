@@ -120,7 +120,20 @@ python -m pytest
 ```
 
 The included tests cover imports, profile filename normalization, basic MOO1/MOO2 IMI
-round-tripping, and construction of the default command-line configuration.
+round-tripping, command-line defaults, MooAPI TCP identification/Hello timing, UDP Hello
+gating, and Dialect A/B UDP regression cases.
+
+
+For MooAPI deployments that need a fixed UDP generation, select it explicitly:
+
+```bash
+pymooserver --mooapi-dialect A
+pymooserver --mooapi-dialect B
+```
+
+The default `auto` mode starts connections in Dialect A and changes a connection to
+Dialect B only after an authenticated, accepted B-only UDP packet. Ambiguous type-01
+UDP payload bytes are not used as a dialect guess.
 
 ## Notes for deployment
 

@@ -6,3 +6,4 @@ def test_default_cli_configuration():
     assert args.host == "0.0.0.0"
     assert args.moo12_ports is None
     assert args.mooapi_ports is None
+    assert args.mooapi_dialect == "auto"

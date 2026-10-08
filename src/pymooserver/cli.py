@@ -489,12 +489,12 @@ async def run_unified(args: argparse.Namespace) -> None:
     mooapi_ports = _unique_ports(args.mooapi_ports, DEFAULT_MOOAPI_PORTS)
 
     LOG.info(
-        'server configuration host=%s legacy_tcp=%s mooapi_tcp=%s mooapi_udp=%s '
+        'server configuration host=%s legacy_tcp=%s mooapi_tcp=%s mooapi_udp=%s mooapi_dialect=%s '
         'ini_root=%s shared_ini=%s status=%s backups=%s legacy_limits=%s/%s '
         'legacy_timeouts=unsigned:%ss write:%ss legacy_ini_limits=files:%s keys:%s bytes:%s watchdog=%ss/%ss',
         args.host, moo12_ports, mooapi_ports,
         'disabled' if args.no_mooapi_udp else [p + 1 for p in mooapi_ports],
-        args.ini_root, args.shared_ini, not args.no_status, not args.no_backups,
+        args.mooapi_dialect, args.ini_root, args.shared_ini, not args.no_status, not args.no_backups,
         args.legacy_max_connections or 'off', args.legacy_max_connections_per_ip or 'off',
         args.legacy_unsigned_timeout, args.legacy_write_timeout,
         args.legacy_ini_max_files or 'off', args.legacy_ini_max_keys_per_file or 'off',
@@ -562,6 +562,7 @@ async def run_unified(args: argparse.Namespace) -> None:
                 motd=args.mooapi_motd.encode('latin-1', errors='replace'),
                 ini_data_root=args.ini_root,
                 ini_shared=args.shared_ini,
+                dialect=args.mooapi_dialect,
             )
             runtime = MooServer(
                 app=_StatusApplication(status_reporter),
@@ -675,6 +676,16 @@ def build_unified_parser() -> argparse.ArgumentParser:
         '--no-mooapi-udp',
         action='store_true',
         help='disable MooAPI UDP Blast listener(s)',
+    )
+    parser.add_argument(
+        '--mooapi-dialect',
+        choices=('auto', 'A', 'B'),
+        default='auto',
+        help=(
+            'MooAPI dialect for all MooAPI realms: auto, A, or B. '
+            'Auto starts in A and switches a connection to B only after an accepted '
+            'B-only UDP packet (default: auto)'
+        ),
     )
     parser.add_argument(
         '--ini-root',

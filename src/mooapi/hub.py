@@ -405,6 +405,8 @@ class Hub:
         connection = self.connections.get(sender_id)
         if connection is None or connection.peer_ip != source_ip_bytes:
             return UdpReceiveResult(False, sender_id, ())
+        if self.config.require_hello and not connection.hello_complete:
+            return UdpReceiveResult(False, sender_id, ())
 
         if isinstance(packet, UdpToServer):
             return UdpReceiveResult(

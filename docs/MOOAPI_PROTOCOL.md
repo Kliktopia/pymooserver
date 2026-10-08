@@ -724,6 +724,12 @@ A claimed sender ID should be associated with the corresponding TCP peer identit
 
 Later Dialect A `User: Blast` traffic is primarily peer-to-peer. A standalone server should not treat every non-zero UDP target as a request for server relay.
 
+### Dialect A/B type-01 ambiguity
+
+Dialect A and Dialect B both use UDP packet type `0x01`, but the header lengths differ. Bytes that are a non-zero `target_id` in Dialect A occupy the start of the payload in Dialect B. Therefore packet contents alone cannot reliably identify the dialect for every type-`0x01` datagram.
+
+A compatible server should use an explicit dialect setting or some independent, unambiguous client-generation signal when it needs to distinguish these forms. A non-zero Dialect-A target must not be reinterpreted as a Dialect-B channel broadcast merely because the same bytes are non-zero.
+
 ### Client generations can differ internally
 
 Dialect B Alias handling is the clearest example. Compatibility policy should be explicit where client behavior is ambiguous rather than assuming one packet form works universally.

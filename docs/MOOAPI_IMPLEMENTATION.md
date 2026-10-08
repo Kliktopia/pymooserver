@@ -195,9 +195,9 @@ The hub allocates a connection and immediately emits:
 
 The transport sends the first two before it has classified the client's first inbound bytes. This intentionally preserves immediate server greeting behavior.
 
-With the default configuration, the client must then send a valid Hello before stateful packets. A repeated Hello is a protocol error.
+With the default configuration, the client must then send a valid Hello before stateful TCP **or UDP** application traffic. A repeated Hello is a protocol error.
 
-Older comparison profiles can disable the Hello requirement.
+Older comparison profiles can disable the Hello requirement. When `require_hello=False`, the Hello deadline is also disabled; optional-Hello clients are not disconnected merely for never sending that packet.
 
 ---
 
@@ -318,7 +318,7 @@ The TCP adapter applies:
 - Hello timeout;
 - partial-packet timeout;
 - idle timeout;
-- bounded pre-identification buffer;
+- bounded pre-identification buffer while the initial protocol prefix remains ambiguous;
 - receive-buffer cap in the stream decoder.
 
 These are runtime protections. They should not be encoded into packet classes or the deterministic Hub unless they become protocol state.
@@ -351,14 +351,11 @@ A connection starts in Dialect A when configuration is `auto`.
 
 TCP client packet layouts do not provide a strong discriminator between A and B, so TCP alone generally leaves the connection in A.
 
-UDP can provide a B discriminator:
+UDP provides one unambiguous B discriminator: packet `0x03` is B-only.
 
-- packet `0x03` is B-only;
-- a B-looking type `0x01` header can also indicate B.
+Dialect-A and Dialect-B type `0x01` datagrams overlap on the wire, so payload bytes are not used to guess B. In `auto` mode, ambiguous type `0x01` traffic stays in the connection's current dialect. Operators that need guaranteed Dialect-B handling can select `B` explicitly with `--mooapi-dialect B` or `ServerConfig(dialect="B")`.
 
-A crucial security rule is that **dialect state is not changed until the UDP sender has been authenticated** against the live TCP connection and source IP.
-
-Otherwise a random datagram could guess a small connection ID and flip another player's TCP encoder to Dialect B.
+A detected dialect is committed only after the UDP sender has been matched to the live TCP connection and source IP **and** the decoded packet has passed Hub validation. This prevents rejected or unrelated traffic from changing the TCP/UDP encoder selected for that connection.
 
 ---
 
@@ -387,10 +384,10 @@ This remains explicitly a best-effort mode. Do not remove the policy switch unle
 3. decode a candidate packet **without committing dialect changes**;
 4. locate the claimed sender ID in the live Hub;
 5. compare UDP source IP with the TCP peer IP;
-6. only then commit a detected dialect;
-7. allocate/use the sender rate bucket;
-8. ask the Hub to validate packet semantics and membership;
-9. only after acceptance, learn the UDP source endpoint;
+6. allocate/use the sender rate bucket;
+7. ask the Hub to validate packet semantics, Hello state, and membership;
+8. only after acceptance, commit any unambiguous dialect detection;
+9. learn the UDP source endpoint;
 10. execute resulting effects.
 
 The order matters for both security and memory safety.

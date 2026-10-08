@@ -134,11 +134,13 @@ class UdpServerAdapter:
         self.rate_buckets.pop(connection_id, None)
 
     def _decode_datagram(self, data: bytes):
-        """Decode without mutating connection state before sender authentication.
+        """Decode a datagram without guessing between overlapping A/B type-01 forms.
 
-        Returns ``(packet_or_error, detected_dialect)``.  In auto mode a B-looking
-        packet may select the B decoder, but the caller commits that dialect only
-        after the claimed sender ID has been authenticated against the TCP peer IP.
+        Returns ``(packet_or_error, detected_dialect)``. In ``auto`` mode a
+        connection begins as dialect A. The only UDP packet that can switch it to
+        dialect B is type ``03``, which is B-only. Ambiguous type ``01`` packets
+        remain in the connection's current dialect. The caller commits a detected
+        dialect only after sender authentication and Hub acceptance.
         """
         if not data:
             return Error("empty UDP datagram"), None
@@ -156,14 +158,14 @@ class UdpServerAdapter:
         )
         detected_dialect = None
 
-        if self.config.dialect == "auto" and connection is not None:
-            # mutate ``connection.dialect`` here: sender IP has not been checked yet.
-            if packet_id == 0x03:
-                dialect = "B"
-                detected_dialect = "B"
-            elif packet_id == 0x01 and len(data) >= 15 and data[11:15] != b"\x00\x00\x00\x00":
-                dialect = "B"
-                detected_dialect = "B"
+        if (
+            self.config.dialect == "auto"
+            and connection is not None
+            and connection.dialect != "B"
+            and packet_id == 0x03
+        ):
+            dialect = "B"
+            detected_dialect = "B"
 
         decode = decode_udp_b if dialect == "B" else decode_udp_a
         return decode(data, maximum=self.config.max_udp_datagram), detected_dialect
@@ -195,9 +197,6 @@ class UdpServerAdapter:
             self._note_drop("source-ip-mismatch")
             return
 
-        if detected_dialect is not None and self.config.dialect == "auto":
-            connection.dialect = detected_dialect
-
         bucket = self.rate_buckets.get(sender_id)
         if bucket is None:
             bucket = TokenBucket(self.config.udp_rate, self.config.udp_burst)
@@ -210,6 +209,9 @@ class UdpServerAdapter:
         if not result.accepted:
             self._note_drop("hub-rejected")
             return
+
+        if detected_dialect is not None and self.config.dialect == "auto":
+            connection.dialect = detected_dialect
 
         # learn only from an accepted datagram associated with this client.
         was_known = sender_id in self.endpoints
