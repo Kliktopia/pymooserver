@@ -72,7 +72,10 @@ byte[length] value
 
 Names, IP strings, MOTD strings, and normal TCP message bodies use this general form.
 
-Names should be treated as opaque 8-bit data. NUL bytes are not expected in normal names.
+A normal message body may have length zero. Names should be treated as opaque 8-bit
+data and are normally non-empty; NUL bytes are not expected in normal names. The
+wire length itself does not imply that player names and session names must share the
+same implementation limit.
 
 ---
 
@@ -164,7 +167,7 @@ i16     client_version
 blob32  player_name
 ```
 
-Later clients normally send this early in the connection lifecycle. Some older compatibility modes appear able to operate without requiring it.
+Later clients normally send this early in the connection lifecycle. Some older compatibility modes appear able to operate without requiring it. Treating an exact duplicate Hello as idempotent is compatible with retrying clients; a Hello that changes identity/version should not be assumed to be a rename operation.
 
 ---
 
@@ -811,3 +814,13 @@ MooGame profile service:
   -> typed payload 0x0B..0x0E
   -> profile operation
 ```
+
+---
+
+## Optional mooDPlay control layer
+
+PyMooServer can carry the mooDPlay DPSC application-control layer over ordinary
+reliable MooAPI ToServer/server-message traffic. It does not alter MooAPI packet
+framing or UDP formats. The DPSC control framing, private session namespace,
+authorization flow, directory records, and host-migration semantics are specified
+separately in [`MOODPLAY_PROTOCOL.md`](MOODPLAY_PROTOCOL.md).

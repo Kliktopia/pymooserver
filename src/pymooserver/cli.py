@@ -9,12 +9,14 @@ import logging.handlers
 import os
 import platform
 import re
-import sys
-import tempfile
+import signal
+import threading
 import time
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
+
+from .paths import default_backup_root, default_ini_root
 
 from .moo12 import (
     DEFAULT_IDENTIFICATION_TIMEOUT,
@@ -44,9 +46,9 @@ from mooapi.moodplay import MooDPlayApplication
 DEFAULT_MOO12_PORTS = (1200,)
 DEFAULT_MOOAPI_PORTS = (1203, 3205)
 DEFAULT_MOOAPI_UDP_OFFSET = 1
-DEFAULT_UNIFIED_INI_ROOT = r'C:\Moo\data\ini'
+DEFAULT_UNIFIED_INI_ROOT = default_ini_root()
 DEFAULT_MOOAPI_MOTD = 'MooAPI Version 1.22'
-DEFAULT_BACKUP_ROOT = r'C:\Moo\data\backups'
+DEFAULT_BACKUP_ROOT = default_backup_root()
 DEFAULT_BACKUP_DAYS = 7
 DEFAULT_BACKUP_CHECK_INTERVAL = 60 * 60
 STATUS_DEBOUNCE_SECONDS = 0.05
@@ -500,18 +502,55 @@ def _configure_logging(args: argparse.Namespace) -> None:
             LOG.error('cannot open persistent log file %s: %s', args.log_file, exc)
 
 
+def _install_sigterm_handler(loop: asyncio.AbstractEventLoop, task: asyncio.Task):
+    """Arrange for SIGTERM to cancel *task* so its ``finally`` cleanup runs.
+
+    Returns a restoration callback. ``loop.add_signal_handler`` is preferred on
+    Unix; the ``signal.signal`` fallback also works on Windows when called from
+    the main thread.
+    """
+    requested = {"value": False}
+    if not hasattr(signal, "SIGTERM"):
+        return (lambda: None), requested
+
+    def request_shutdown(*_args):
+        requested["value"] = True
+        loop.call_soon_threadsafe(task.cancel)
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, request_shutdown)
+    except (NotImplementedError, RuntimeError):
+        if threading.current_thread() is not threading.main_thread():
+            return (lambda: None), requested
+        previous = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, request_shutdown)
+
+        def restore():
+            signal.signal(signal.SIGTERM, previous)
+
+        return restore, requested
+
+    def restore():
+        try:
+            loop.remove_signal_handler(signal.SIGTERM)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    return restore, requested
+
+
 async def run_unified(args: argparse.Namespace) -> None:
     loop = asyncio.get_running_loop()
     previous_exception_handler = loop.get_exception_handler()
 
     def _loop_exception_handler(_loop, context):
         message = context.get('message', 'unhandled asyncio exception')
-        exc = context.get('exception')
-        if exc is not None:
+        runtime_exc = context.get('exception')
+        if runtime_exc is not None:
             LOG.error(
                 'asyncio runtime exception: %s',
                 message,
-                exc_info=(type(exc), exc, exc.__traceback__),
+                exc_info=(type(runtime_exc), runtime_exc, runtime_exc.__traceback__),
             )
         else:
             LOG.error('asyncio runtime exception: %s', message)
@@ -554,7 +593,15 @@ async def run_unified(args: argparse.Namespace) -> None:
     mooapi_servers = []
     mooapi_realms = []
     backup_realms = []
+    # Track every long-lived task created by this invocation.  asyncio.gather()
+    # does not cancel sibling tasks when one fails, so explicit ownership here is
+    # important when run_unified() is embedded in an already-running event loop.
+    tasks = []
     status_reporter = _StateStatusReporter(legacy_realms, mooapi_realms, enabled=not args.no_status)
+    current_task = asyncio.current_task()
+    if current_task is None:  # pragma: no cover - asyncio always supplies this here
+        raise RuntimeError("run_unified has no current task")
+    restore_sigterm, _sigterm_state = _install_sigterm_handler(loop, current_task)
 
     try:
         for port in moo12_ports:
@@ -596,6 +643,7 @@ async def run_unified(args: argparse.Namespace) -> None:
                 ini_data_root=args.ini_root,
                 ini_shared=args.shared_ini,
                 dialect=args.mooapi_dialect,
+                identification_timeout=args.identification_timeout,
             )
             app = (
                 _StatusApplication(status_reporter)
@@ -610,8 +658,6 @@ async def run_unified(args: argparse.Namespace) -> None:
                 udp_port=(port + 1) if not args.no_mooapi_udp else None,
                 enable_udp=not args.no_mooapi_udp,
             )
-            if isinstance(app, MooDPlayApplication):
-                app.bind(runtime)
             await runtime.start()
             mooapi_servers.append(runtime)
             mooapi_realms.append((port, runtime))
@@ -652,12 +698,15 @@ async def run_unified(args: argparse.Namespace) -> None:
                     args.backup_root,
                     args.backup_days,
                     args.backup_check_interval,
-                )
+                ),
+                name='backup-monitor',
             ))
         if not tasks:
             raise RuntimeError('no listeners configured')
         try:
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             for task in tasks:
                 if task.done() and not task.cancelled():
@@ -674,6 +723,14 @@ async def run_unified(args: argparse.Namespace) -> None:
     finally:
         LOG.info('server shutdown starting')
         status_reporter.close()
+        # A failure in one gather() child does not cancel its siblings.  Cancel
+        # and await all tasks we own so programmatic callers do not inherit live
+        # listener/watchdog/backup tasks after run_unified() returns or raises.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for listener in legacy_listeners:
             listener.close()
         if legacy_listeners:
@@ -687,6 +744,7 @@ async def run_unified(args: argparse.Namespace) -> None:
                 return_exceptions=True,
             )
         trace.close()
+        restore_sigterm()
         loop.set_exception_handler(previous_exception_handler)
         LOG.info('server shutdown complete')
 
@@ -736,7 +794,7 @@ def build_unified_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--ini-root',
         default=DEFAULT_UNIFIED_INI_ROOT,
-        help=r'INI/IMI root (default: C:\Moo\data\ini; per-port folders are created)',
+        help='INI/IMI root (default: %s; per-port folders are created)' % DEFAULT_UNIFIED_INI_ROOT,
     )
     parser.add_argument(
         '--shared-ini',
@@ -751,7 +809,7 @@ def build_unified_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--backup-root',
         default=DEFAULT_BACKUP_ROOT,
-        help=r'ZIP backup directory (default: C:\Moo\data\backups)',
+        help='ZIP backup directory (default: %s)' % DEFAULT_BACKUP_ROOT,
     )
     parser.add_argument(
         '--backup-days',
@@ -839,7 +897,7 @@ def build_unified_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--log-file',
         default=DEFAULT_LOG_FILE,
-        help=r'persistent rotating log file (default: C:\Moo\data\logs\moo-server.log)',
+        help='persistent rotating log file (default: %s)' % DEFAULT_LOG_FILE,
     )
     parser.add_argument(
         '--no-file-log',
@@ -912,9 +970,10 @@ def main() -> int:
         asyncio.run(run_unified(args))
     except KeyboardInterrupt:
         return 130
+    except asyncio.CancelledError:
+        # SIGTERM cancels the main server task after its normal cleanup runs.
+        return 143
     except (OSError, ValueError) as exc:
         LOG.error('%s', exc)
         return 2
     return 0
-
-

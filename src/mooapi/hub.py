@@ -54,6 +54,7 @@ class Hub:
         self.connections: dict[int, Connection] = {}
         self.sessions: dict[int, Session] = {}
         self._sessions_by_name: dict[bytes, int] = {}
+        self._join_admission = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -78,6 +79,14 @@ class Hub:
             ApplicationEvent("connect", connection_id, name=connection.name),
         )
         return ConnectResult(connection_id, effects)
+
+    def set_join_admission(self, callback) -> None:
+        """Install an optional synchronous admission check for Join packets.
+
+        The callback receives ``(connection_id, session_name)`` and returns a
+        truthy value to permit the Hub to emit any join-related effects.
+        """
+        self._join_admission = callback
 
     def set_motd(self, motd: bytes) -> None:
         """Set the MOTD used for future connections.
@@ -153,8 +162,10 @@ class Hub:
     # Packet handlers
     # ------------------------------------------------------------------
     def _hello(self, connection: Connection, packet: Hello) -> tuple[Effect, ...]:
-        if connection.hello_complete and self.config.require_hello:
-            return self.protocol_error(connection.id, "repeated hello")
+        if connection.hello_complete:
+            if connection.version == packet.version and connection.name == packet.name:
+                return ()
+            return self.protocol_error(connection.id, "conflicting repeated hello")
         connection.version = packet.version
         connection.name = packet.name
         connection.hello_complete = True
@@ -169,6 +180,16 @@ class Hub:
             # ignore duplicate joins by default.  Clients do not
             # de-duplicate 06/07, so the default is to ignore repeats.
             return ()
+
+        if self._join_admission is not None:
+            try:
+                admitted = bool(self._join_admission(connection.id, name))
+            except Exception:
+                # Admission policy must fail closed rather than partially joining
+                # a client if an application policy check itself is broken.
+                admitted = False
+            if not admitted:
+                return ()
 
         if len(connection.session_ids) >= self.config.max_sessions_per_connection:
             return ()
@@ -614,6 +635,14 @@ class Hub:
                 session.member_ids.pop(0)
                 continue
             effects.extend(self._leave(connection, session_id, notify_leaver=True))
+
+        # The normal _leave path removes an empty session. If the only members
+        # were stale IDs, perform the same cleanup here rather than leaving an
+        # empty session/name mapping behind indefinitely.
+        session = self.sessions.get(session_id)
+        if session is not None and not session.member_ids:
+            self.sessions.pop(session_id, None)
+            self._sessions_by_name.pop(session.name, None)
         return tuple(effects)
 
     def rename_connection(self, connection_id: int, name: bytes) -> tuple[Effect, ...]:

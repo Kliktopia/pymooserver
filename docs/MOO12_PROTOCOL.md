@@ -515,7 +515,7 @@ Useful compatibility rules include:
 - matching single or double quotes surrounding a stored value may be removed on read;
 - line endings may be CRLF, LF, CR, or mixed.
 
-A common server-side convention is to store profiles physically as `.imi` files regardless of the extension supplied by the client. That is a storage convention rather than an additional wire field.
+A common server-side convention is to store profiles physically as `.imi` files regardless of the extension supplied by the client. That is a storage convention rather than an additional wire field. Profile writes represent one logical section/key/value entry; implementations backed by line-oriented INI files should reject field contents that would create additional physical records rather than allowing them to forge sections or keys.
 
 ---
 
@@ -539,7 +539,7 @@ version.exe   -> version.imi
 data.old.dat  -> data.old.imi
 ```
 
-This normalization is storage behavior. The wire protocol itself still transports the filename supplied by the client.
+This normalization is storage behavior. The wire protocol itself still transports the filename supplied by the client. A filesystem-backed implementation should also prevent logical profile names from acquiring platform-specific path/device semantics (for example Windows device names or alternate data stream syntax).
 
 ---
 

@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import socket
+import stat
 import sys
 import tempfile
 import time
@@ -23,11 +24,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+from .paths import default_data_root, default_ini_root, default_log_file
+
 
 LOG = logging.getLogger("moo12")
 DEFAULT_PORT = 1200
-DEFAULT_DATA_ROOT = r"C:\Moo\data\ini"
-DEFAULT_INI_DIR = r"C:\Moo\data\ini\1200"
+DEFAULT_DATA_ROOT = default_data_root()
+DEFAULT_INI_DIR = str(Path(default_ini_root()) / "1200")
 DEFAULT_SERVER_TEXT = "MOO compatibility server"
 HISTORICAL_MOTD_FALLBACK = "MOO homepage: http://www.3ee.com/"
 HISTORICAL_SERVER_FALLBACK = (
@@ -63,7 +66,7 @@ DEFAULT_LEGACY_INI_MAX_FILES = 256
 DEFAULT_LEGACY_INI_MAX_KEYS_PER_FILE = 4096
 DEFAULT_LEGACY_INI_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_CLOSE_TIMEOUT = 2.0
-DEFAULT_LOG_FILE = r"C:\Moo\data\logs\moo-server.log"
+DEFAULT_LOG_FILE = default_log_file()
 DEFAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
 DEFAULT_LOG_BACKUPS = 5
 DEFAULT_WATCHDOG_INTERVAL = 5.0
@@ -78,17 +81,31 @@ def _line(text: str) -> bytes:
     return _wire(text + "\n")
 
 
+def _abort_writer(writer: asyncio.StreamWriter) -> None:
+    """Force-close a writer transport when graceful teardown cannot make progress."""
+    transport = getattr(writer, "transport", None)
+    if transport is not None:
+        try:
+            transport.abort()
+        except (ConnectionError, OSError, RuntimeError):
+            pass
+
+
 async def _safe_close_writer(writer: asyncio.StreamWriter) -> None:
-    """Close a writer without allowing Windows teardown to hang indefinitely."""
+    """Close a writer, force-aborting if graceful teardown stalls."""
     try:
         writer.close()
     except (ConnectionError, OSError, RuntimeError):
+        _abort_writer(writer)
         return
 
     try:
         await asyncio.wait_for(writer.wait_closed(), timeout=DEFAULT_CLOSE_TIMEOUT)
-    except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError, asyncio.CancelledError):
-        pass
+    except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+        _abort_writer(writer)
+    except asyncio.CancelledError:
+        _abort_writer(writer)
+        raise
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -100,6 +117,12 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     complete file visible.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = None
+    try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        pass
+
     fd, tmp_name = tempfile.mkstemp(
         prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
     )
@@ -110,6 +133,8 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             fp.write(data)
             fp.flush()
             os.fsync(fp.fileno())
+        if existing_mode is not None:
+            os.chmod(tmp_path, existing_mode)
         os.replace(tmp_path, path)
     finally:
         if fd >= 0:
@@ -158,6 +183,12 @@ def _classify_initial_bytes(data: bytes) -> Optional[str]:
     This is transport hardening only. Once a stream is identified as MOS, the
     historical fixed-prefix dispatcher remains authoritative.
     """
+    if not data:
+        return None
+
+    # Blank LF/CRLF records are harmless to the MOS dispatcher. Ignore them for
+    # preface identification so a client may send a blank record before signon.
+    data = data.lstrip(b"\r\n")
     if not data:
         return None
 
@@ -331,6 +362,30 @@ class Client:
         await self.writer.drain()
 
 
+_WINDOWS_DEVICE_NAMES = {
+    "con", "prn", "aux", "nul",
+    *("com%d" % i for i in range(1, 10)),
+    *("lpt%d" % i for i in range(1, 10)),
+}
+_WINDOWS_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+
+
+def _safe_profile_stem(value: str, limit: int) -> str:
+    """Map an arbitrary client basename to a portable ordinary filename stem."""
+    cleaned = "".join(
+        "_" if ord(ch) < 32 or ch in _WINDOWS_INVALID_FILENAME_CHARS else ch
+        for ch in value
+    ).rstrip(" .")
+    cleaned = cleaned or "moo"
+    # Windows reserves device basenames even when another suffix follows
+    # (for example CON.foo). Check the component before the first dot.
+    device_base = cleaned.split(".", 1)[0]
+    if device_base.casefold() in _WINDOWS_DEVICE_NAMES:
+        cleaned = "_" + cleaned
+    cleaned = cleaned[:limit].rstrip(" .") or "moo"
+    return cleaned
+
+
 class IniStore:
     """Backing store for MOO2 server-side IMI operations.
 
@@ -391,7 +446,7 @@ class IniStore:
         # than preserved or appended (e.g. .ini/.exe/.dat -> .imi).
         dot = name.rfind(".")
         stem = name[:dot] if dot > 0 else name
-        stem = stem[:106] or "moo"
+        stem = _safe_profile_stem(stem, 106)
         wanted = stem + ".imi"
 
         wanted_fold = wanted.casefold()
@@ -484,7 +539,31 @@ class IniStore:
             value = value[1:-1]
         return value[:cls._PROFILE_VALUE_MAX]
 
+    @classmethod
+    def _valid_query_fields(cls, section: str, key: str) -> bool:
+        section_b = cls._to_bytes(section)
+        key_b = cls._to_bytes(key)
+        key_name = cls._trim(key_b)
+        return (
+            b"\r" not in section_b
+            and b"\n" not in section_b
+            and b"]" not in section_b
+            and b"\r" not in key_b
+            and b"\n" not in key_b
+            and b"=" not in key_b
+            and not key_name.startswith((b";", b"["))
+        )
+
+    @classmethod
+    def _valid_write_fields(cls, section: str, key: str, value: str) -> bool:
+        if not cls._valid_query_fields(section, key):
+            return False
+        value_b = cls._to_bytes(value)
+        return b"\r" not in value_b and b"\n" not in value_b
+
     def get(self, filename: str, section: str, key: str, default: str = "") -> str:
+        if not self._valid_query_fields(section, key):
+            return default
         path = self._path(filename)
         if not path.exists():
             return default
@@ -563,6 +642,8 @@ class IniStore:
         return line if existing else line + eol
 
     def set(self, filename: str, section: str, key: str, value: str) -> bool:
+        if not self._valid_write_fields(section, key, value):
+            return False
         path = self._path(filename)
         existed = path.exists()
         if not existed and self.max_files and self._file_count() >= self.max_files:
@@ -744,7 +825,7 @@ class Moo12Server:
                 "realm %d closing stalled writer %s after %.1fs",
                 self.realm_port, client.peer_label, self.write_timeout,
             )
-            await _safe_close_writer(client.writer)
+            _abort_writer(client.writer)
         except (ConnectionError, OSError, RuntimeError) as exc:
             client.send_failed = True
             LOG.debug(
@@ -1021,10 +1102,10 @@ class Moo12Server:
                 buffer.extend(chunk)
 
                 if not identified:
-                    if len(buffer) > self.preidentify_buffer:
+                    classification = _classify_initial_bytes(bytes(buffer))
+
+                    if classification is None and len(buffer) > self.preidentify_buffer:
                         classification = "unknown"
-                    else:
-                        classification = _classify_initial_bytes(bytes(buffer))
 
                     if classification is None:
                         if identify_deadline is None:

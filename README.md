@@ -22,8 +22,8 @@ the network and protocol behavior remains unchanged.
 
 - Python 3.11 or newer
 - No third-party runtime dependencies
-- Windows is the primary deployment target; the asyncio implementation is also
-  written to remain portable where the required socket behavior is available.
+- Windows, Linux, and macOS are supported. Windows retains the historical
+  `C:\Moo\data` default layout; other platforms use native per-user data paths.
 
 ## Install
 
@@ -45,7 +45,8 @@ After installation:
 pymooserver
 ```
 
-Or directly from the source tree:
+The module form is also available after the package has been installed (including
+an editable development install):
 
 ```bash
 python -m pymooserver
@@ -56,7 +57,8 @@ options.
 
 ## Data layout
 
-With the default settings, server-side profile files are stored per TCP realm:
+With the default settings, server-side profile files are stored per TCP realm.
+On Windows the layout remains:
 
 ```text
 C:\Moo\data\ini\1200\
@@ -64,11 +66,17 @@ C:\Moo\data\ini\1203\
 C:\Moo\data\ini\3205\
 ```
 
+Linux uses `$XDG_DATA_HOME/pymooserver` when `XDG_DATA_HOME` is set, otherwise
+`~/.local/share/pymooserver`. macOS uses
+`~/Library/Application Support/PyMooServer`. The same `ini/<port>`, `backups`, and
+`logs` sub-layout is used beneath those platform roots.
+
 Client-supplied profile extensions are normalized to `.imi` for physical storage.
 For example, `version`, `version.ini` and `version.exe` all resolve to
 `version.imi`.
 
-Changed IMI data is backed up periodically to:
+Changed IMI data is backed up periodically beneath the platform data root, for
+example on Windows:
 
 ```text
 C:\Moo\data\backups\PORT-YYYY-MM-DD.zip
@@ -77,7 +85,7 @@ C:\Moo\data\backups\PORT-YYYY-MM-DD.zip
 ## Logging
 
 Console logging is enabled by default. A rotating persistent log is also written
-to:
+beneath the platform data root, for example on Windows:
 
 ```text
 C:\Moo\data\logs\moo-server.log
@@ -92,6 +100,7 @@ logging normal message payloads or INI values.
 - [`docs/MOO12_IMPLEMENTATION.md`](docs/MOO12_IMPLEMENTATION.md) explains how PyMooServer implements that protocol and its less obvious compatibility rules.
 - [`docs/MOOAPI_PROTOCOL.md`](docs/MOOAPI_PROTOCOL.md) describes MooAPI TCP, UDP/Blast, Dialects A/B, and MooGame application-level payloads.
 - [`docs/MOOAPI_IMPLEMENTATION.md`](docs/MOOAPI_IMPLEMENTATION.md) maps the MooAPI protocol onto the codec, state machine, transports, and profile service.
+- [`docs/MOODPLAY_PROTOCOL.md`](docs/MOODPLAY_PROTOCOL.md) specifies the optional DPSC mooDPlay control layer carried over a normal MooAPI connection.
 
 Each protocol guide stands on its own. The corresponding implementation guide builds on that protocol guide and may also point to shared launcher behavior.
 
@@ -108,6 +117,7 @@ src/
     transport/       asyncio TCP/UDP adapters
     hub.py           protocol state machine
     server.py        application-facing server API
+    moodplay.py      optional DPSC mooDPlay application layer
 ```
 
 `mooapi` remains a top-level package so the implementation keeps the same imports
@@ -119,9 +129,10 @@ and public API it used before being split out of the standalone file.
 python -m pytest
 ```
 
-The included tests cover imports, profile filename normalization, basic MOO1/MOO2 IMI
-round-tripping, command-line defaults, MooAPI TCP identification/Hello timing, UDP Hello
-gating, and Dialect A/B UDP regression cases.
+The included tests cover imports, profile filename normalization and injection
+protection, MOO1/MOO2 transport regressions, command-line/runtime defaults, MooAPI
+stream/Hello/master/rate-limit behavior, UDP dialect handling, and mooDPlay
+claim/list/auth/kick/migration flows. CI runs the suite on Windows and Ubuntu.
 
 
 For MooAPI deployments that need a fixed UDP generation, select it explicitly:
@@ -141,7 +152,8 @@ The default configuration is designed for a public long-running server, includin
 connection limits, stale-client handling, bounded UDP work, persistent diagnostics
 and periodic changed-data backups. Before exposing it publicly, review the defaults
 shown by `--help` and ensure the chosen TCP/UDP ports are permitted by the host
-firewall.
+firewall. SIGTERM triggers the same orderly listener/client cleanup path used by
+normal shutdown; Ctrl+C remains available for interactive use.
 
 ## License
 
@@ -155,5 +167,8 @@ completes the normal MooAPI handshake, then explicitly identifies itself using t
 reserved reliable DPSC control channel. Native MooAPI clients remain in the normal
 realm; identified mooDPlay clients use a separate application-GUID-scoped logical
 session namespace with authoritative host, kick, password, max-player and migration
-handling. mooDPlay controls are TCP-only; native UDP/Blast behavior remains available
-to ordinary MooAPI clients. Use `--no-moodplay` to disable the enhancement.
+handling. Admission policy is checked before the underlying MooAPI join is committed,
+so rejected password/full/namespace joins do not briefly expose session membership.
+mooDPlay controls are TCP-only; native UDP/Blast behavior remains available on other
+subchannels. Use `--no-moodplay` to disable the enhancement. See
+[`docs/MOODPLAY_PROTOCOL.md`](docs/MOODPLAY_PROTOCOL.md) for the DPSC framing and opcodes.

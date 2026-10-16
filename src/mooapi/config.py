@@ -3,8 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
+import platform
+from pathlib import Path, PureWindowsPath
 
 from .codec.primitives import CodecLimits
+
+
+def _default_ini_data_root() -> str:
+    """Return a platform-native default root for MooAPI profile files."""
+    system = platform.system()
+    if system == "Windows":
+        return str(PureWindowsPath(r"C:\\Moo\data") / "ini")
+    if system == "Darwin":
+        return str(Path.home() / "Library" / "Application Support" / "PyMooServer" / "ini")
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return str(base / "pymooserver" / "ini")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +65,7 @@ class ServerConfig:
     log_foreign_payloads: bool = False
     hello_timeout: float = 30.0
     partial_packet_timeout: float = 30.0
-    idle_timeout: float = 30.0 * 60.0  # 0 disables
+    idle_timeout: float = 0.0  # 0 disables; opt in to application-level idle disconnects
     max_send_queue: int = 1024 * 1024
     tcp_read_size: int = 64 * 1024
     write_timeout: float = 10.0
@@ -61,7 +76,7 @@ class ServerConfig:
     byte_rate: float = 256 * 1024.0
     byte_burst: float = 512 * 1024.0
     join_rename_rate: float = 5.0
-    join_rename_burst: float = 5.0
+    join_rename_burst: float = 32.0
     max_udp_datagram: int = 4096
     udp_rate: float = 200.0
     udp_burst: float = 200.0
@@ -73,20 +88,24 @@ class ServerConfig:
     # saved data between this Python server, the Python MOO1/MOO2 server, and
     # original MOO/MOS deployments without requiring a database export/conversion.
     ini_enabled: bool = True
+    # Retained for source compatibility with earlier releases. Filesystem-backed
+    # PyMooServer profiles are always canonical .imi files, so False does not
+    # change the physical extension.
     ini_append_imi: bool = True
     ini_namespace: str = "default"
-    # Filesystem-only profile layout used by the unified server.  By default each
-    # TCP realm gets its own directory: C:\Moo\data\ini\<tcp-port>.
-    # Set ini_shared=True to use ini_data_root directly, or ini_directory to name
-    # an exact directory.
-    ini_data_root: str = r"C:\Moo\data\ini"
+    # Filesystem-only profile layout. By default each TCP realm gets its own
+    # directory under the platform-native profile root (C:\Moo\data\ini on
+    # Windows, XDG/local-share on Linux, Application Support on macOS). Set
+    # ini_shared=True to use ini_data_root directly, or ini_directory to name an
+    # exact directory.
+    ini_data_root: str = field(default_factory=_default_ini_data_root)
     ini_shared: bool = False
     ini_directory: str | None = None
     ini_max_files: int = 64
     ini_max_keys_per_file: int = 4096
     ini_max_bytes: int = 4 * 1024 * 1024
-    ini_write_rate: float = 20.0
-    ini_write_burst: float = 20.0
+    ini_write_rate: float = 0.0
+    ini_write_burst: float = 0.0
 
     @classmethod
     def original_b_comparison(cls, **overrides):

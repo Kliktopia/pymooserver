@@ -5,15 +5,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .server import Client, Session
+    from .server import Client, MooServer, Session
 
 
 class MooApplication:
     """Base application with optional sync or async hooks.
 
-    Subclasses may implement any hook as either ``def`` or ``async def``.  Hook
-    arguments are lightweight action facades; application payloads remain raw bytes.
+    Subclasses may implement any event hook as either ``def`` or ``async def``.
+    ``bind`` is a synchronous lifecycle hook called once by :class:`MooServer`
+    after the runtime has been constructed.
     """
+
+    def bind(self, server: "MooServer") -> None:
+        pass
 
     def on_connect(self, client: "Client") -> None:
         pass

@@ -193,6 +193,9 @@ class MooServer:
         self._ini_write_buckets: dict[int, TokenBucket] = {}
         if self.config.ini_enabled:
             self._configure_ini_store(port)
+        # Applications that need runtime-aware policy (notably mooDPlay join
+        # admission) are bound automatically for both CLI and programmatic use.
+        self.app.bind(self)
 
     def _ini_directory_for_port(self, port: int) -> str:
         if self.config.ini_directory:
@@ -257,13 +260,20 @@ class MooServer:
         if self.tcp.server is not None and self.tcp.server.sockets:
             actual_tcp_port = int(self.tcp.server.sockets[0].getsockname()[1])
             self.base_udp_port = actual_tcp_port + 1
-            if (
-                self.config.ini_enabled
-                and self.port == 0
-                and not self.config.ini_directory
-                and not self.config.ini_shared
-            ):
-                self._configure_ini_store(actual_tcp_port)
+            if self.config.ini_enabled:
+                if self.ini is None:
+                    # close() releases the store. Recreate it on a later start so
+                    # a MooServer instance remains restartable at a fixed port.
+                    self._configure_ini_store(actual_tcp_port)
+                elif (
+                    self.port == 0
+                    and not self.config.ini_directory
+                    and not self.config.ini_shared
+                ):
+                    # An ephemeral TCP port is not known during construction; move
+                    # realm-local profile storage from the provisional /0 directory
+                    # to the actual listener port once it has been assigned.
+                    self._configure_ini_store(actual_tcp_port)
         if self.enable_udp:
             bind_udp_port = (
                 self.base_udp_port
@@ -408,7 +418,12 @@ class MooServer:
         elif event.kind == "server_message":
             assert event.subchannel is not None and event.data is not None
             if self.ini is not None:
-                if event.data and event.data[0] in (0x0B, 0x0C):
+                if (
+                    event.data
+                    and event.data[0] in (0x0B, 0x0C)
+                    and self.config.ini_write_rate > 0
+                    and self.config.ini_write_burst > 0
+                ):
                     bucket = self._ini_write_buckets.get(client.id)
                     if bucket is None:
                         bucket = TokenBucket(
@@ -416,8 +431,8 @@ class MooServer:
                         )
                         self._ini_write_buckets[client.id] = bucket
                     if not bucket.consume(1):
-                        # over-budget INI writes are dropped without a
-                        # response, matching the service's normal Set semantics.
+                        # Set has no wire acknowledgement. Throttling is therefore
+                        # opt-in because an over-budget write is necessarily silent.
                         return
                 consumed, reply = self.ini.handle(event.data)
                 if consumed:

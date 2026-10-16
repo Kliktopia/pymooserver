@@ -102,3 +102,33 @@ def test_large_first_tcp_read_is_classified_before_preidentify_cap():
 
 def test_optional_hello_does_not_keep_hello_timeout():
     asyncio.run(_run_optional_hello_timeout_case())
+
+
+def test_safe_close_force_aborts_when_wait_closed_stalls():
+    from mooapi.transport.tcp import _safe_close_writer
+
+    class _Transport:
+        def __init__(self):
+            self.aborted = False
+
+        def abort(self):
+            self.aborted = True
+
+    class _StallingWriter:
+        def __init__(self):
+            self.transport = _Transport()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            raise asyncio.TimeoutError
+
+    async def scenario():
+        writer = _StallingWriter()
+        await _safe_close_writer(writer)
+        assert writer.closed
+        assert writer.transport.aborted
+
+    asyncio.run(scenario())

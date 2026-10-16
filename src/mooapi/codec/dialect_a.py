@@ -51,7 +51,16 @@ def _message(reader: Reader, limits: CodecLimits, label: str = "message") -> byt
     return reader.blob_u32(
         label=label,
         maximum=limits.max_message_bytes,
+        minimum=0,
+    )
+
+
+def _session_name(reader: Reader, limits: CodecLimits) -> bytes:
+    return reader.blob_u32(
+        label="session name",
+        maximum=limits.max_session_name_bytes,
         minimum=1,
+        reject_nul=True,
     )
 
 
@@ -98,7 +107,7 @@ def decode_client_packet(
         elif packet_id == 0x03:
             packet = PrivateMessage(r.i16(), r.u32(), r.u32(), _message(r, limits))
         elif packet_id == 0x04:
-            packet = Join(_name(r, limits, "session name"))
+            packet = Join(_session_name(r, limits))
         elif packet_id == 0x05:
             packet = Leave(r.u32())
         elif packet_id == 0x0B:
@@ -126,13 +135,13 @@ def encode_client_packet(packet: ClientPacket, limits: CodecLimits = DEFAULT_LIM
             b"\x01"
             + pack_i16(packet.subchannel)
             + pack_u32(packet.channel_id, label="channel_id")
-            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=1)
+            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=0)
         )
     if isinstance(packet, ToServer):
         return (
             b"\x02"
             + pack_i16(packet.subchannel)
-            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=1)
+            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=0)
         )
     if isinstance(packet, PrivateMessage):
         return (
@@ -140,10 +149,10 @@ def encode_client_packet(packet: ClientPacket, limits: CodecLimits = DEFAULT_LIM
             + pack_i16(packet.subchannel)
             + pack_u32(packet.channel_id, label="channel_id")
             + pack_u32(packet.target_id, label="target_id")
-            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=1)
+            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=0)
         )
     if isinstance(packet, Join):
-        return b"\x04" + _pack_name(packet.name, limits, "session name")
+        return b"\x04" + _pack_session_name(packet.name, limits)
     if isinstance(packet, Leave):
         return b"\x05" + pack_u32(packet.channel_id, label="channel_id")
     if isinstance(packet, Rename):
@@ -189,7 +198,7 @@ def decode_server_packet(
             elif packet_id == 0x07:
                 packet = Exists(player_id, channel_id, master_id, name, ip)
             else:
-                session_name = _name(r, limits, "session name")
+                session_name = _session_name(r, limits)
                 packet = Welcome(player_id, channel_id, master_id, name, ip, session_name)
         elif packet_id == 0x0A:
             text = r.blob_u32(
@@ -226,7 +235,7 @@ def encode_server_packet(packet: ServerPacket, limits: CodecLimits = DEFAULT_LIM
             + pack_i16(packet.subchannel)
             + pack_u32(packet.channel_id, label="channel_id")
             + pack_u32(packet.sender_id, label="sender_id")
-            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=1)
+            + pack_blob_u32(packet.data, label="message", maximum=limits.max_message_bytes, minimum=0)
         )
     if isinstance(packet, Left):
         if packet.channel_id == 0:
@@ -248,7 +257,7 @@ def encode_server_packet(packet: ServerPacket, limits: CodecLimits = DEFAULT_LIM
             + pack_blob_u32(packet.ip, label="ip", maximum=limits.max_ip_bytes, minimum=1, reject_nul=True)
         )
         if isinstance(packet, Welcome):
-            prefix += _pack_name(packet.session_name, limits, "session name")
+            prefix += _pack_session_name(packet.session_name, limits)
         return prefix
     if isinstance(packet, Motd):
         return b"\x0A" + pack_blob_u32(
@@ -274,6 +283,16 @@ def _pack_name(value: bytes, limits: CodecLimits, label: str) -> bytes:
         value,
         label=label,
         maximum=limits.max_name_bytes,
+        minimum=1,
+        reject_nul=True,
+    )
+
+
+def _pack_session_name(value: bytes, limits: CodecLimits) -> bytes:
+    return pack_blob_u32(
+        value,
+        label="session name",
+        maximum=limits.max_session_name_bytes,
         minimum=1,
         reject_nul=True,
     )

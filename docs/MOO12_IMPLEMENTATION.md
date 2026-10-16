@@ -84,19 +84,26 @@ MooAPI     TCP 3205 / UDP 3206
 
 The launcher checks that a TCP port is not assigned to both protocol families.
 
+SIGTERM is handled as an orderly service shutdown: the main asyncio task is cancelled,
+normal `finally` cleanup closes listeners/transports and diagnostic resources, and the
+CLI exits with status 143. A main-thread `signal.signal()` fallback is used on platforms
+where asyncio loop signal handlers are unavailable.
+
 ---
 
 ## Realm-local profile directories
 
-By default every TCP realm gets an independent profile directory:
-
-```text
-C:\Moo\data\ini\1200\
-C:\Moo\data\ini\1203\
-C:\Moo\data\ini\3205\
-```
+By default every TCP realm gets an independent profile directory. Windows keeps
+the historical `C:\Moo\data\ini\<port>` layout. Linux uses
+`$XDG_DATA_HOME/pymooserver/ini/<port>` (or `~/.local/share/pymooserver/ini/<port>`),
+and macOS uses `~/Library/Application Support/PyMooServer/ini/<port>`.
 
 This prevents unrelated games/realms from modifying the same logical profile unless the operator explicitly enables shared storage.
+
+Client profile basenames are also made portable before `.imi` storage. Windows
+reserved device names are checked on the component before the first dot, so names
+such as `CON.ini` and `CON.foo.ini` cannot accidentally address a device when the
+data directory is moved to or hosted on Windows.
 
 The port used for the directory is the TCP realm port, including for MooAPI servers whose profile service is reached through binary packets.
 
@@ -177,7 +184,8 @@ The implementation therefore:
 
 - marks a client after a failed/stalled send;
 - stops repeatedly writing to a known-dead/closing writer;
-- closes that transport safely;
+- force-aborts a transport immediately when `writer.drain()` itself times out;
+- bounds graceful close and falls back to transport abort if `wait_closed()` stalls;
 - broadcasts concurrently to a snapshot of recipients.
 
 This is transport hardening; it does not add a wire-level failure packet.
@@ -364,7 +372,10 @@ foo.exe   -> foo.imi
 foo.a.dat -> foo.a.imi
 ```
 
-Client directory components are discarded/sandboxed.
+Client directory components are discarded/sandboxed. Windows-reserved device names,
+control characters, alternate-stream colons, and other Windows filename-special
+characters are mapped to ordinary portable basenames even when the server is running
+on another platform.
 
 Existing filenames are located case-insensitively.
 
@@ -372,9 +383,9 @@ Existing filenames are located case-insensitively.
 
 Profile writes use a temporary file in the same directory, flush and `fsync` it, then `os.replace()` the destination.
 
-This protects an existing profile against truncation if the process, disk, or antivirus layer fails during a write.
+This protects an existing profile against truncation if the process, disk, or antivirus layer fails during a write. When replacing an existing file on a POSIX filesystem, the previous permission mode is copied to the temporary file before `os.replace()` so an update does not unexpectedly reset it to the temporary-file default.
 
-If an existing profile cannot be read, a write fails rather than pretending the file is empty and overwriting it.
+If an existing profile cannot be read, a write fails rather than pretending the file is empty and overwriting it. Section names containing CR/LF or `]`, keys containing CR/LF or `=`, and values containing CR/LF are rejected on write so one logical `inistring` cannot synthesize additional profile records.
 
 ### Limits
 
@@ -413,11 +424,14 @@ A corrupt ZIP or invalid/missing manifest is not accepted as a valid recent back
 
 The launcher configures both console and rotating file logging by default.
 
-Default persistent location:
+On Windows the default persistent location is:
 
 ```text
 C:\Moo\data\logs\moo-server.log
 ```
+
+Linux and macOS use the same `logs/moo-server.log` subpath beneath their
+platform-native data roots described above.
 
 Normal logs intentionally include operational state such as:
 
@@ -472,7 +486,7 @@ That limitation is important when interpreting stall warnings.
 
 Normal profile reads/writes and logging still perform local filesystem work from the process that owns the asyncio event loop.
 
-For ordinary local `C:\Moo\data` storage this is normally short-lived. A severely stalled disk, network-mounted data directory, antivirus filter, or filesystem problem can delay all realms because they share one event loop.
+For ordinary local storage beneath the platform-native data root this is normally short-lived. A severely stalled disk, network-mounted data directory, antivirus filter, or filesystem problem can delay all realms because they share one event loop.
 
 Moving profile I/O wholesale to worker threads is not a free improvement: shared profile files would then require explicit serialization/locking to preserve read-modify-write ordering.
 

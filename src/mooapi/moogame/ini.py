@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
+import stat
 import struct
 import tempfile
 from pathlib import Path
@@ -17,6 +18,11 @@ class IniError(ValueError):
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = None
+    try:
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        pass
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     tmp_path = Path(tmp_name)
     try:
@@ -25,6 +31,8 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             fp.write(data)
             fp.flush()
             os.fsync(fp.fileno())
+        if existing_mode is not None:
+            os.chmod(tmp_path, existing_mode)
         os.replace(tmp_path, path)
     finally:
         if fd >= 0:
@@ -148,6 +156,27 @@ def _ascii_fold(value: bytes) -> bytes:
     return bytes((c + 32 if 65 <= c <= 90 else c) for c in value)
 
 
+_WINDOWS_DEVICE_NAMES = {
+    b"con", b"prn", b"aux", b"nul",
+    *(b"com%d" % i for i in range(1, 10)),
+    *(b"lpt%d" % i for i in range(1, 10)),
+}
+_WINDOWS_INVALID_FILENAME_BYTES = set(b'<>:"/\\|?*')
+
+
+def _safe_profile_stem(value: bytes, limit: int) -> bytes:
+    cleaned = bytes(
+        0x5F if byte < 32 or byte in _WINDOWS_INVALID_FILENAME_BYTES else byte
+        for byte in value
+    ).rstrip(b" .")
+    cleaned = cleaned or b"moo"
+    device_base = cleaned.split(b".", 1)[0]
+    if _ascii_fold(device_base) in _WINDOWS_DEVICE_NAMES:
+        cleaned = b"_" + cleaned
+    cleaned = cleaned[:limit].rstrip(b" .") or b"moo"
+    return cleaned
+
+
 def normalize_filename(value: bytes, *, append_imi: bool = True) -> bytes:
     # supported 1.20/1.23-era hosts use a 0x60 (96-byte) filename bound.
     # Directory components are not part of the compatibility namespace, so strip
@@ -156,11 +185,10 @@ def normalize_filename(value: bytes, *, append_imi: bool = True) -> bytes:
     raw = value.replace(b"\\", b"/")
     name = raw.rsplit(b"/", 1)[-1] or b"moo"
     if not append_imi:
-        return name[:96]
+        return _safe_profile_stem(name, 96)
     dot = name.rfind(b".")
     stem = name[:dot] if dot > 0 else name
-    stem = stem or b"moo"
-    return stem[:92] + b".imi"
+    return _safe_profile_stem(stem, 92) + b".imi"
 
 
 class IniStore(Protocol):
@@ -258,12 +286,8 @@ class FilesystemIniStore:
         # Moo profile names are 8-bit strings.  Ignore client directories and
         # force the physical backing filename to .imi even if a caller bypasses
         # normalize_filename() and supplies another extension.
-        raw = filename.decode("latin-1", errors="replace").replace("\\", "/")
-        name = raw.rsplit("/", 1)[-1] or "moo"
-        dot = name.rfind(".")
-        stem = name[:dot] if dot > 0 else name
-        stem = stem[:92] or "moo"
-        wanted = stem + ".imi"
+        normalized = normalize_filename(filename, append_imi=True)
+        wanted = normalized.decode("latin-1", errors="replace")
         folded = wanted.casefold()
         try:
             for existing in self.root.iterdir():
@@ -273,8 +297,27 @@ class FilesystemIniStore:
             pass
         return self.root / wanted
 
+    @classmethod
+    def _valid_query_fields(cls, group: bytes, item: bytes) -> bool:
+        item_name = cls._trim(item)
+        return (
+            b"\r" not in group
+            and b"\n" not in group
+            and b"]" not in group
+            and b"\r" not in item
+            and b"\n" not in item
+            and b"=" not in item
+            and not item_name.startswith((b";", b"["))
+        )
+
+    @classmethod
+    def _valid_write_fields(cls, group: bytes, item: bytes, value: bytes) -> bool:
+        return cls._valid_query_fields(group, item) and b"\r" not in value and b"\n" not in value
+
     def get(self, namespace, filename, group, item):
         del namespace  # directory isolation replaces the old logical namespace
+        if not self._valid_query_fields(group, item):
+            return None
         path = self._path(filename)
         if not path.exists():
             return None
@@ -309,6 +352,8 @@ class FilesystemIniStore:
 
     def set(self, namespace, filename, group, item, value):
         del namespace
+        if not self._valid_write_fields(group, item, value):
+            return False
         path = self._path(filename)
         existed = path.exists()
         if not existed and self.max_files and self._file_count() >= self.max_files:

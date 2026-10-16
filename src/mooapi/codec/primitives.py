@@ -13,6 +13,7 @@ P = TypeVar("P")
 @dataclass(frozen=True, slots=True)
 class CodecLimits:
     max_name_bytes: int = 64
+    max_session_name_bytes: int = 255
     max_message_bytes: int = 65_536
     max_motd_bytes: int = 1_024
     max_ip_bytes: int = 64

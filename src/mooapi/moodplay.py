@@ -31,6 +31,10 @@ CAP_KICK = 1 << 1
 CAP_MAX_PLAYERS = 1 << 2
 CAP_PASSWORD = 1 << 3
 CAP_HOST_MIGRATION = 1 << 4
+
+HOST_NO_MIGRATION = 0
+HOST_MIGRATE = 1
+
 CAPS = (
     CAP_AUTHORITATIVE_HOST
     | CAP_KICK
@@ -110,12 +114,49 @@ class MooDPlayApplication(MooApplication):
 
     def bind(self, runtime):
         self.runtime = runtime
+        runtime.hub.set_join_admission(self._admit_join)
         return self
 
+    def _admit_join(self, connection_id: int, name: bytes) -> bool:
+        """Apply mooDPlay namespace/password/capacity policy before Hub join effects."""
+        if self.runtime is None:
+            return False
+        internal = split_wire_session_name(name)
+        identified = connection_id in self.moodplay_clients
+        if bool(internal) != identified:
+            return False
+        if not identified:
+            return True
+
+        sid = self.runtime.hub._sessions_by_name.get(name)
+        if sid is None:
+            # First member creates the namespaced room, then CLAIM establishes
+            # its directory/host policy.
+            return True
+        session = self.runtime.hub.sessions.get(sid)
+        if session is None:
+            return False
+        state = self.sessions.get(sid)
+        if state is None:
+            # While a room is waiting for CLAIM, only its existing Moo master may
+            # issue a duplicate join. Other clients must not race into it.
+            return session.master_id == connection_id
+        if state.closing:
+            return False
+        if len(session.member_ids) >= self.runtime.config.max_members_per_session:
+            return False
+        if state.max_users and len(session.member_ids) >= state.max_users:
+            return False
+        if state.password and (connection_id, sid) not in self.authorized_joins:
+            return False
+        return True
+
     def on_udp_server_message(self, client, subchannel, data):
-        # mooDPlay control traffic is deliberately TCP-only.  Native MooAPI UDP/Blast
-        # remains available to ordinary clients on the same listener.
-        return None
+        # mooDPlay control traffic is deliberately TCP-only. Ordinary application
+        # UDP/Blast traffic must continue through the normal MooApplication path.
+        if subchannel == CONTROL_SUBCHANNEL:
+            return None
+        return super().on_udp_server_message(client, subchannel, data)
 
     async def on_server_message(self, client, subchannel, data):
         if subchannel != CONTROL_SUBCHANNEL:
@@ -149,14 +190,26 @@ class MooDPlayApplication(MooApplication):
                 return
             guid = bytes(body)
             records = []
+            # LIST_REPLY itself is the payload of a normal MooAPI message, so keep
+            # the complete control frame within the configured message cap. The
+            # fixed frame/count overhead is 8 bytes and each record adds 15 bytes
+            # plus its visible name.
+            budget = self.runtime.config.codec.max_message_bytes
+            used = 8
             for sid, state in self.sessions.items():
                 if state.guid != guid or state.closing:
                     continue
                 sess = self.runtime._session(sid)
                 current = len(sess.clients)
-                joinable = not state.max_users or current < state.max_users
+                within_server_cap = current < self.runtime.config.max_members_per_session
+                within_app_cap = not state.max_users or current < state.max_users
+                joinable = within_server_cap and within_app_cap
                 flags = (1 if state.password else 0) | (2 if joinable else 0)
+                record_size = 15 + len(state.visible_name)
+                if used + record_size > budget:
+                    break
                 records.append((sid, current, state.max_users, flags, state.visible_name))
+                used += record_size
             await client.send(list_reply(records), subchannel=CONTROL_SUBCHANNEL)
             return
 
@@ -174,7 +227,9 @@ class MooDPlayApplication(MooApplication):
             if state is not None and not state.closing:
                 sess = self.runtime._session(sid)
                 current = len(sess.clients)
-                if state.max_users and current >= state.max_users:
+                if current >= self.runtime.config.max_members_per_session:
+                    reason = b"Session is full."
+                elif state.max_users and current >= state.max_users:
                     reason = b"Session is full."
                 elif supplied != state.password:
                     reason = b"Incorrect password."
@@ -190,10 +245,17 @@ class MooDPlayApplication(MooApplication):
             if len(body) < 25:
                 return
             sid, host_type, max_users = struct.unpack_from("<IBI", body, 0)
+            if host_type not in (HOST_NO_MIGRATION, HOST_MIGRATE):
+                return
             guid = body[9:25]
             password = body[25:]
             sess = next((s for s in client.sessions if s.id == sid), None)
             if sess is None:
+                return
+            # Only the underlying Moo session master may establish mooDPlay
+            # authority for an unclaimed room. Membership alone is insufficient:
+            # otherwise a second client could race the creator and steal CLAIM.
+            if sess.master is None or sess.master.id != client.id:
                 return
             parsed_name = split_wire_session_name(sess.name)
             if parsed_name is None or parsed_name[0] != guid:
@@ -248,9 +310,11 @@ class MooDPlayApplication(MooApplication):
 
         state = self.sessions.get(session.id)
         if state is None:
-            # The host joins before it can send CLAIM.  Joining a correctly
-            # namespaced room is therefore allowed temporarily; CLAIM turns it
-            # into an advertised compatibility session.
+            # The creator must join before it can send CLAIM.  Only the underlying
+            # Moo master may remain in an unclaimed namespaced room; this prevents
+            # another identified client from racing the creator before CLAIM.
+            if session.master is None or session.master.id != client.id:
+                await session.sign_off(client)
             return
         auth_key = (client.id, session.id)
         if state.password and auth_key not in self.authorized_joins:
@@ -265,8 +329,11 @@ class MooDPlayApplication(MooApplication):
         if state is None or state.closing or state.host_id != client.id:
             return
         remaining = [p for p in session.clients if p.id != client.id]
-        if state.host_type == 1 and remaining:
-            state.host_id = min(p.id for p in remaining)
+        if state.host_type == HOST_MIGRATE and remaining:
+            # Keep mooDPlay authority aligned with Hub.master_id. Session.clients
+            # preserves membership order; numeric connection IDs only reflect
+            # connection order and can disagree with join order.
+            state.host_id = remaining[0].id
             await session.broadcast(
                 frame(OP_HOST_CHANGED, struct.pack("<II", session.id, state.host_id)),
                 subchannel=CONTROL_SUBCHANNEL,
@@ -275,6 +342,9 @@ class MooDPlayApplication(MooApplication):
             state.closing = True
             await session.destroy()
             self.sessions.pop(session.id, None)
+            self.authorized_joins = {
+                key for key in self.authorized_joins if key[1] != session.id
+            }
 
     def on_disconnect(self, client):
         self.moodplay_clients.discard(client.id)

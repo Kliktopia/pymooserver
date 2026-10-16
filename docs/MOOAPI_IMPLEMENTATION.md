@@ -107,17 +107,19 @@ MooAPI     TCP 3205 / UDP 3206
 
 The launcher checks that a TCP port is not assigned to both protocol families.
 
+SIGTERM is handled as an orderly service shutdown: the main asyncio task is cancelled,
+normal `finally` cleanup closes listeners/transports and diagnostic resources, and the
+CLI exits with status 143. A main-thread `signal.signal()` fallback is used on platforms
+where asyncio loop signal handlers are unavailable.
+
 ---
 
 ## Realm-local profile directories
 
-By default every TCP realm gets an independent profile directory:
-
-```text
-C:\Moo\data\ini\1200\
-C:\Moo\data\ini\1203\
-C:\Moo\data\ini\3205\
-```
+By default every TCP realm gets an independent profile directory. Windows keeps
+the historical `C:\Moo\data\ini\<port>` layout. Linux uses
+`$XDG_DATA_HOME/pymooserver/ini/<port>` (or `~/.local/share/pymooserver/ini/<port>`),
+and macOS uses `~/Library/Application Support/PyMooServer/ini/<port>`.
 
 This prevents unrelated games/realms from modifying the same logical profile unless the operator explicitly enables shared storage.
 
@@ -195,9 +197,23 @@ The hub allocates a connection and immediately emits:
 
 The transport sends the first two before it has classified the client's first inbound bytes. This intentionally preserves immediate server greeting behavior.
 
-With the default configuration, the client must then send a valid Hello before stateful TCP **or UDP** application traffic. A repeated Hello is a protocol error.
+With the default configuration, the client must then send a valid Hello before stateful TCP **or UDP** application traffic. An exact duplicate Hello (same version and name) is treated as idempotent; a conflicting repeated Hello is a protocol error rather than an implicit rename or version renegotiation.
 
 Older comparison profiles can disable the Hello requirement. When `require_hello=False`, the Hello deadline is also disabled; optional-Hello clients are not disconnected merely for never sending that packet.
+
+---
+
+## Codec length policy
+
+Player/alias/Hello names and session names use separate implementation caps. The
+default ordinary-name cap remains 64 bytes, while session names allow up to 255
+bytes. The larger session bound accommodates namespaced application layers such as
+mooDPlay without exposing every native client to 255-byte player aliases. Normal
+message payloads may be empty; names remain non-empty.
+
+Dialect-A Alias (`0x0B`) encoding is exactly one player ID followed by one blob32
+name, matching the decoder and protocol guide. Dialect-B alias policy remains a
+separate compatibility choice.
 
 ---
 
@@ -284,6 +300,43 @@ Again, the use of ordered lists/sets in this code is deliberate.
 
 ---
 
+
+## mooDPlay application integration
+
+`MooDPlayApplication` is an application layer on the ordinary MooAPI runtime, not a
+second transport. `MooServer` calls the application's synchronous `bind()` lifecycle
+hook during construction so the same behavior applies to CLI-created and
+programmatically-created servers. The mooDPlay application uses that hook to install
+a synchronous Hub join-admission check.
+
+The admission check runs before `Hub._join()` mutates membership or emits Welcome,
+Joined, or Exists packets. It enforces the native/private namespace boundary,
+unclaimed-room authority, password authorization, the mooDPlay maximum-player rule,
+and the Hub's own per-session member cap. Application `on_join` checks remain as a
+defensive second layer, but normal rejection happens before any join is visible on
+the wire.
+
+Only the underlying Moo session master may CLAIM an unclaimed room. Host migration
+uses the session's ordered member list rather than numeric connection-ID order, so
+mooDPlay authority stays aligned with `Session.master_id` when clients connect and
+join in different orders. Unknown host-policy values are rejected rather than
+implicitly mapped onto the no-migration policy.
+
+DPSC LIST replies are bounded to `codec.max_message_bytes` at complete-record
+boundaries. A large directory therefore returns a truncated but valid list instead
+of failing during normal MooAPI message encoding. The joinable flag reflects both
+mooDPlay's declared `max_users` and the Hub's hard member cap.
+
+The reserved DPSC subchannel is TCP-only. `MooDPlayApplication` suppresses UDP
+ToServer traffic only on that reserved control subchannel; ordinary UDP application
+subchannels continue through the normal `MooApplication.on_udp_server_message`
+path.
+
+See [`MOODPLAY_PROTOCOL.md`](MOODPLAY_PROTOCOL.md) for the client-visible DPSC wire
+and state model.
+
+---
+
 ## MooAPI outbound queue and write timeout
 
 Each TCP peer has an asynchronous send queue and a byte count of queued payloads.
@@ -291,7 +344,7 @@ Each TCP peer has an asynchronous send queue and a byte count of queued payloads
 Two limits protect the whole process from a client that stops reading:
 
 - `max_send_queue`: closes a peer before queued bytes can grow without bound;
-- `write_timeout`: bounds `writer.drain()`.
+- `write_timeout`: bounds `writer.drain()`; if graceful writer shutdown itself stalls, the underlying transport is force-aborted after a bounded close attempt.
 
 A critical invariant is that transport closure must also remove the connection from the Hub. Earlier designs that only closed the socket could leave ghost users and sessions indefinitely.
 
@@ -314,14 +367,14 @@ The TCP adapter applies:
 - per-IP connection-rate token bucket;
 - packet-rate token bucket;
 - byte-rate token bucket;
-- join/leave/rename-rate token bucket;
+- join/leave/rename-rate token bucket (default burst matches the 32-session-per-connection cap);
 - Hello timeout;
 - partial-packet timeout;
-- idle timeout;
+- optional idle timeout (disabled by default);
 - bounded pre-identification buffer while the initial protocol prefix remains ambiguous;
 - receive-buffer cap in the stream decoder.
 
-These are runtime protections. They should not be encoded into packet classes or the deterministic Hub unless they become protocol state.
+These are runtime protections. They should not be encoded into packet classes or the deterministic Hub unless they become protocol state. When an idle timeout is explicitly enabled, successful inbound **or outbound** traffic refreshes activity; the read loop re-checks the deadline after a timeout so an outbound send cannot be defeated by a stale wait deadline.
 
 The per-IP connection-rate cache is bounded/pruned so random source addresses cannot create permanent memory growth.
 
@@ -479,6 +532,12 @@ If consumed:
 
 Non-INI payloads continue to `on_server_message`.
 
+INI write throttling is disabled by default. Set operations have no acknowledgement,
+so a default token bucket would create silent data loss under legitimate bursts. An
+operator may explicitly enable `ini_write_rate` and `ini_write_burst`; only then are
+over-budget Set requests silently dropped. File/key/byte limits remain enabled and
+provide bounded storage independently of request-rate throttling.
+
 This routing boundary is important if adding other application-level services.
 
 ---
@@ -493,9 +552,11 @@ Rules:
 2. strip client directory components before applying the filename limit;
 3. replace the final extension with `.imi`;
 4. cap the stem so the final filename stays within the expected bound;
-5. perform case-insensitive physical lookup.
+5. map Windows-reserved device names and filename-special characters (including
+   alternate-stream `:` syntax) to ordinary portable basenames;
+6. perform case-insensitive physical lookup.
 
-Stripping directories **before** truncation is significant. If a long client path were truncated first, it could consume the whole filename allowance and collapse an ordinary basename into the wrong physical name.
+Stripping directories **before** truncation is significant. If a long client path were truncated first, it could consume the whole filename allowance and collapse an ordinary basename into the wrong physical name. Section/key/value writes that could synthesize additional INI records are rejected rather than rewritten. Existing POSIX file modes are preserved across atomic replacement.
 
 ---
 
@@ -540,11 +601,14 @@ A corrupt ZIP or invalid/missing manifest is not accepted as a valid recent back
 
 The launcher configures both console and rotating file logging by default.
 
-Default persistent location:
+On Windows the default persistent location is:
 
 ```text
 C:\Moo\data\logs\moo-server.log
 ```
+
+Linux and macOS use the same `logs/moo-server.log` subpath beneath their
+platform-native data roots described above.
 
 Normal logs intentionally include operational state such as:
 
@@ -599,7 +663,7 @@ That limitation is important when interpreting stall warnings.
 
 Normal profile reads/writes and logging still perform local filesystem work from the process that owns the asyncio event loop.
 
-For ordinary local `C:\Moo\data` storage this is normally short-lived. A severely stalled disk, network-mounted data directory, antivirus filter, or filesystem problem can delay all realms because they share one event loop.
+For ordinary local storage beneath the platform-native data root this is normally short-lived. A severely stalled disk, network-mounted data directory, antivirus filter, or filesystem problem can delay all realms because they share one event loop.
 
 Moving profile I/O wholesale to worker threads is not a free improvement: shared profile files would then require explicit serialization/locking to preserve read-modify-write ordering.
 
@@ -699,6 +763,7 @@ High-value MooAPI invariants include:
 | `README.md` | installation, operation, defaults, repository overview |
 | `docs/MOOAPI_PROTOCOL.md` | implementation-independent MooAPI wire/state model |
 | `docs/MOOAPI_IMPLEMENTATION.md` | this implementation guide |
+| `docs/MOODPLAY_PROTOCOL.md` | mooDPlay DPSC application-control protocol |
 | `docs/MOO12_PROTOCOL.md` | separate MOO1/MOO2 wire/state model |
 | `docs/MOO12_IMPLEMENTATION.md` | separate MOO1/MOO2 implementation guide |
 | `tests/` | executable regression claims |

@@ -27,21 +27,31 @@ _HTTP_PREFIXES = (
 
 
 
-async def _safe_close_writer(writer: asyncio.StreamWriter) -> None:
-    """Dispose of an asyncio writer without leaking Windows Proactor close errors.
+def _abort_writer(writer: asyncio.StreamWriter) -> None:
+    """Force-close the underlying transport when graceful close cannot finish."""
+    transport = getattr(writer, "transport", None)
+    if transport is not None:
+        try:
+            transport.abort()
+        except (ConnectionError, OSError, RuntimeError):
+            pass
 
-    This is intentionally used only for shutdown/cleanup.  Cancellation during
-    ordinary reads and writes should still propagate normally.
-    """
+
+async def _safe_close_writer(writer: asyncio.StreamWriter) -> None:
+    """Dispose of a writer, force-aborting if graceful teardown stalls."""
     try:
         writer.close()
     except (ConnectionError, OSError, RuntimeError):
+        _abort_writer(writer)
         return
 
     try:
         await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
-    except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError, asyncio.CancelledError):
-        pass
+    except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+        _abort_writer(writer)
+    except asyncio.CancelledError:
+        _abort_writer(writer)
+        raise
 
 def _classify_initial_bytes(data: bytes) -> str | None:
     """Classify a new inbound stream before feeding it to the Moo decoder.
@@ -179,6 +189,8 @@ class TcpPeer:
                     await asyncio.wait_for(
                         self.writer.drain(), timeout=self.adapter.config.write_timeout
                     )
+                    if self.adapter.config.idle_timeout:
+                        self.last_valid_packet = monotonic()
                 finally:
                     self.pending_bytes -= len(payload)
         except asyncio.TimeoutError:
@@ -241,7 +253,12 @@ class TcpPeer:
                             self.reader.read(self.adapter.config.tcp_read_size), timeout
                         )
                 except asyncio.TimeoutError:
-                    self.close_reason = self._timeout_reason()
+                    timeout_reason = self._timeout_reason()
+                    if timeout_reason is None:
+                        # Activity may have refreshed a deadline while the read
+                        # was already waiting on the previous timeout. Recompute.
+                        continue
+                    self.close_reason = timeout_reason
                     self.adapter._log.info(
                         "TCP %d id=%d closing reason=%s buffered=%d pending=%d",
                         self.adapter.port, self.connection_id, self.close_reason,
@@ -377,7 +394,7 @@ class TcpPeer:
                 await self.adapter.runtime._handle_effects(effects)
             await self.close_writer()
 
-    def _timeout_reason(self) -> str:
+    def _timeout_reason(self) -> str | None:
         cfg = self.adapter.config
         now = monotonic()
         connection = self.adapter.runtime.hub.connections.get(self.connection_id)
@@ -401,7 +418,9 @@ class TcpPeer:
             and now >= self.partial_since + cfg.partial_packet_timeout
         ):
             return "partial packet timeout"
-        return "idle timeout"
+        if cfg.idle_timeout and now >= self.last_valid_packet + cfg.idle_timeout:
+            return "idle timeout"
+        return None
 
     async def close_writer(self) -> None:
         if self.closed:
