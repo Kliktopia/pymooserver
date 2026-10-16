@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PyMooServer"
+version = "0.1.3"
+description = "Standalone Python server for classic MOO1/MOO2 and MooAPI clients"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = []
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kliktopia/pymooserver"
+Repository = "https://github.com/Kliktopia/pymooserver"
+Issues = "https://github.com/Kliktopia/pymooserver/issues"
+
+[project.scripts]
+pymooserver = "pymooserver.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pymooserver*", "mooapi*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
