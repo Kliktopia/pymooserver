@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Mapping
 
 
@@ -22,15 +22,25 @@ def default_data_root(
     """
     system = system or platform.system()
     environ = os.environ if environ is None else environ
-    home_path = Path.home() if home is None else Path(home)
 
     if system == "Windows":
         return str(PureWindowsPath(r"C:\Moo\data"))
+
+    # Construct POSIX paths with POSIX semantics even when a different host OS
+    # (for example the Windows CI runner) is exercising this branch in tests.
+    home_value = str(Path.home()) if home is None else str(home)
+    home_path = PurePosixPath(home_value.replace("\\", "/"))
+
     if system == "Darwin":
         return str(home_path / "Library" / "Application Support" / "PyMooServer")
 
     xdg = environ.get("XDG_DATA_HOME", "").strip()
-    base = Path(xdg).expanduser() if xdg else home_path / ".local" / "share"
+    if xdg.startswith("~/"):
+        base = home_path / xdg[2:]
+    elif xdg == "~":
+        base = home_path
+    else:
+        base = PurePosixPath(xdg) if xdg else home_path / ".local" / "share"
     return str(base / "pymooserver")
 
 
@@ -38,18 +48,18 @@ def default_ini_root(**kwargs) -> str:
     root = default_data_root(**kwargs)
     if (kwargs.get("system") or platform.system()) == "Windows":
         return str(PureWindowsPath(root) / "ini")
-    return str(Path(root) / "ini")
+    return str(PurePosixPath(root) / "ini")
 
 
 def default_backup_root(**kwargs) -> str:
     root = default_data_root(**kwargs)
     if (kwargs.get("system") or platform.system()) == "Windows":
         return str(PureWindowsPath(root) / "backups")
-    return str(Path(root) / "backups")
+    return str(PurePosixPath(root) / "backups")
 
 
 def default_log_file(**kwargs) -> str:
     root = default_data_root(**kwargs)
     if (kwargs.get("system") or platform.system()) == "Windows":
         return str(PureWindowsPath(root) / "logs" / "moo-server.log")
-    return str(Path(root) / "logs" / "moo-server.log")
+    return str(PurePosixPath(root) / "logs" / "moo-server.log")

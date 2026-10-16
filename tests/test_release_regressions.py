@@ -30,7 +30,11 @@ def test_platform_default_paths():
     assert default_log_file(system="Windows") == r"C:\Moo\data\logs\moo-server.log"
 
     assert default_data_root(system="Linux", environ={}, home="/home/test") == "/home/test/.local/share/pymooserver"
+    assert default_ini_root(system="Linux", environ={}, home="/home/test") == "/home/test/.local/share/pymooserver/ini"
+    assert default_backup_root(system="Linux", environ={}, home="/home/test") == "/home/test/.local/share/pymooserver/backups"
+    assert default_log_file(system="Linux", environ={}, home="/home/test") == "/home/test/.local/share/pymooserver/logs/moo-server.log"
     assert default_data_root(system="Linux", environ={"XDG_DATA_HOME": "/srv/data"}, home="/home/test") == "/srv/data/pymooserver"
+    assert default_data_root(system="Linux", environ={"XDG_DATA_HOME": "~/data"}, home="/home/test") == "/home/test/data/pymooserver"
     assert default_data_root(system="Darwin", environ={}, home="/Users/test") == "/Users/test/Library/Application Support/PyMooServer"
 
 
