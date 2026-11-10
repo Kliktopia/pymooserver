@@ -39,6 +39,12 @@ class ServerConfig:
     # older MooGame 1.01 standalone behavior does not relay its private UDP form.
     # Keep server relay available only as an explicit compatibility experiment.
     relay_private_blast: bool = False
+    # Dialect-A User:Blast (UDP 01 with a non-zero target) is peer-to-peer in the
+    # original Moo, which fails when players are behind NAT or share one public IP.
+    # When a redirected client sends it to this server instead, relay it to the
+    # target if both players are members of the named session. The pymooserver CLI
+    # turns this on; ``--mooapi-no-relay-blast`` turns it off.
+    relay_direct_blast: bool = False
 
     max_connections: int = 512
     max_connections_per_ip: int = 8

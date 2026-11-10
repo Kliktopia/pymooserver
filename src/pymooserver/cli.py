@@ -645,6 +645,7 @@ async def run_unified(args: argparse.Namespace) -> None:
                 ini_shared=args.shared_ini,
                 dialect=args.mooapi_dialect,
                 identification_timeout=args.identification_timeout,
+                relay_direct_blast=not args.mooapi_no_relay_blast,
             )
             app = (
                 _StatusApplication(status_reporter)
@@ -781,6 +782,15 @@ def build_unified_parser() -> argparse.ArgumentParser:
         '--no-mooapi-udp',
         action='store_true',
         help='disable MooAPI UDP Blast listener(s)',
+    )
+    parser.add_argument(
+        '--mooapi-no-relay-blast',
+        action='store_true',
+        help=(
+            'do not relay dialect-A User:Blast UDP (non-zero target) between session '
+            'members; by default it is relayed so redirected MooClick games work '
+            'behind NAT'
+        ),
     )
     parser.add_argument(
         '--mooapi-dialect',

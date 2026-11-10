@@ -468,6 +468,43 @@ class Hub:
             )
             return UdpReceiveResult(True, sender_id, tuple(effects))
 
+        if packet.target_id != 0 and self.config.relay_direct_blast:
+            # Server relay of a dialect-A User:Blast that a redirected client sent
+            # here instead of to the peer (see ServerConfig.relay_direct_blast).
+            session = self.sessions.get(packet.channel_id)
+            if (
+                session is None
+                or packet.target_id == sender_id
+                or sender_id not in session.member_ids
+                or packet.target_id not in session.member_ids
+            ):
+                return UdpReceiveResult(False, sender_id, ())
+            return UdpReceiveResult(
+                True,
+                sender_id,
+                (
+                    SendUdp(
+                        packet.target_id,
+                        UdpChannelBlast(
+                            packet.subchannel,
+                            session.id,
+                            sender_id,
+                            packet.target_id,
+                            packet.data,
+                        ),
+                    ),
+                    ApplicationEvent(
+                        "udp_private_message",
+                        sender_id,
+                        session.id,
+                        packet.subchannel,
+                        packet.data,
+                        target_id=packet.target_id,
+                        name=session.name,
+                    ),
+                ),
+            )
+
         if packet.target_id != 0:
             # dialect-A User:Blast uses the same type-01 packet with a
             # non-zero target, but sends it directly to the peer IP rather than to a
